@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { access, cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,17 +5,30 @@ import { fileURLToPath } from "node:url";
 // Assembles the loadable Chrome extension in ./extension from Next.js' static
 // export in ./out, and writes the MV3 manifest.
 //
-// The interesting part is the Content Security Policy. Manifest V3 applies
-// `script-src 'self'` to extension pages, which forbids inline scripts -- and
-// a Next.js App Router export always inlines its RSC payload as
-// `<script>self.__next_f.push(...)</script>`. Without help the page renders but
-// never hydrates. MV3 will not accept 'unsafe-inline', so instead we hash each
-// inline script with SHA-256 and allow exactly those via the manifest CSP.
+// Two Next.js/MV3 conflicts are resolved here:
+//
+// 1. Reserved filenames. Chrome's CheckForIllegalFilenames (extensions/common/
+//    file_util.cc) walks only the TOP level of the extension root -- false for
+//    "recurse" -- and rejects any name starting with "_", because Next.js emits
+//    a whole `_next/` tree. So we nest the export under `assets/`: the top level
+//    then holds only assets/, index.html and manifest.json, while every `_next`
+//    URL Next emits keeps working untouched. `assetPrefix: "/assets"` in
+//    next.config.ts is what makes those URLs line up. Nothing is rewritten.
+//
+// 2. Content Security Policy. MV3 applies `script-src 'self'` to extension
+//    pages, which forbids inline scripts -- and a Next.js App Router export
+//    always inlines its RSC payload as `<script>self.__next_f.push(...)</script>`.
+//    Without help the page renders but never hydrates. The policy cannot be
+//    relaxed: MV3 rejects both 'unsafe-inline' and 'sha256-…' hash sources, so
+//    the payload is moved out into same-origin .js files, which 'self' allows.
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = path.join(root, "out");
 const extDir = path.join(root, "extension");
 const iconsSrcDir = path.join(root, "assets", "icons");
+
+// Must match `assetPrefix` in next.config.ts.
+const ASSETS_DIR = "assets";
 const NEW_TAB_ENTRY = "index.html";
 const ICON_SIZES = [16, 32, 48, 128];
 
@@ -52,8 +64,11 @@ await mkdir(extDir, { recursive: true });
 
 await cp(path.join(outDir, NEW_TAB_ENTRY), path.join(extDir, NEW_TAB_ENTRY));
 
-if (await exists(path.join(outDir, "_next", "static"))) {
-  await cp(path.join(outDir, "_next", "static"), path.join(extDir, "_next", "static"), {
+// Nest `_next` (and its leading underscore) under assets/. Chrome only inspects
+// the top level, so this is what makes the extension loadable. The `_next` name
+// is preserved below so the URLs Next generated keep resolving as-is.
+if (await exists(path.join(outDir, "_next"))) {
+  await cp(path.join(outDir, "_next"), path.join(extDir, ASSETS_DIR, "_next"), {
     recursive: true,
   });
 }
@@ -72,30 +87,62 @@ if (await exists(path.join(outDir, "favicon.ico"))) {
   await cp(path.join(outDir, "favicon.ico"), path.join(extDir, "favicon.ico"));
 }
 
-// --- 3. hash the inline scripts ---------------------------------------------
+// --- 3. externalise the inline scripts --------------------------------------
 //
-// <script> is an HTML raw-text element: the parser hands the exact bytes
-// between the tags to the script engine without decoding entities. Hashing
-// that raw slice therefore matches what the browser hashes.
-
-const html = await readFile(path.join(extDir, NEW_TAB_ENTRY), "utf8");
+// Manifest V3 applies `script-src 'self'` to extension pages. That forbids
+// inline scripts, and unlike CSP2 you cannot relax the policy: MV3 rejects
+// 'unsafe-inline' *and* 'sha256-…' hash sources. So the only way to ship the
+// App Router payload is to stop inlining it.
+//
+// Next emits the RSC payload as
+//   <script>(self.__next_f=self.__next_f||[]).push([0])</script>
+//   <script>self.__next_f.push([1,"…"])</script>
+// Both just push onto `self.__next_f`, so moving them into same-origin files
+// loaded in the same document order preserves the semantics exactly. 'self'
+// already covers them, so no CSP change is needed.
 
 const SCRIPT_RE = /<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi;
-const hashes = new Set();
-let inlineCount = 0;
+const flightDir = path.join(extDir, ASSETS_DIR);
+const flightFiles = [];
 
-for (const match of html.matchAll(SCRIPT_RE)) {
-  const [, attrs, body] = match;
-  if (/\bsrc\s*=/i.test(attrs)) continue; // external, already covered by 'self'
-  inlineCount += 1;
-  hashes.add(`'sha256-${createHash("sha256").update(body, "utf8").digest("base64")}'`);
+let page = await readFile(path.join(extDir, NEW_TAB_ENTRY), "utf8");
+
+page = page.replace(SCRIPT_RE, (whole, attrs, body) => {
+  if (/\bsrc\s*=/i.test(attrs)) return whole; // already a file, covered by 'self'
+  if (/\S/.test(body) === false) return ""; // empty tag, drop it
+
+  // A literal </script> inside the payload would already have terminated the
+  // original tag, so its absence is a sanity check, not a transformation.
+  if (/<\/script/i.test(body)) {
+    fail("Inline script contains a literal </script> and cannot be externalised.");
+  }
+
+  const name = `flight-${flightFiles.length}.js`;
+  flightFiles.push({ name, body });
+  return `<script src="/${ASSETS_DIR}/${name}"></script>`;
+});
+
+await mkdir(flightDir, { recursive: true });
+for (const { name, body } of flightFiles) {
+  await writeFile(path.join(flightDir, name), body);
 }
+await writeFile(path.join(extDir, NEW_TAB_ENTRY), page);
+
+// Nothing inline may survive: 'self' cannot execute it and Chrome will refuse
+// the manifest before the page ever runs.
+const remainingInline = [...page.matchAll(SCRIPT_RE)].filter(
+  ([, attrs, body]) => !/\bsrc\s*=/i.test(attrs) && /\S/.test(body),
+);
+if (remainingInline.length > 0) {
+  fail(`${remainingInline.length} inline script(s) survived; MV3 would block them.`);
+}
+
+const inlineCount = 0;
+const html = page;
 
 // --- 4. verify the export is actually extension-safe ------------------------
 
 const problems = [];
-
-// MV3 forbids eval / new Function.
 
 const collectJs = async (dir) => {
   const found = [];
@@ -107,10 +154,26 @@ const collectJs = async (dir) => {
   return found;
 };
 
-for (const file of await collectJs(path.join(extDir, "_next", "static"))) {
-  const code = await readFile(file, "utf8");
-  if (/\beval\s*\(/.test(code) || /new\s+Function\s*\(/.test(code)) {
-    problems.push(`${path.relative(extDir, file)} uses eval/new Function, which MV3 blocks`);
+const assetsDir = path.join(extDir, ASSETS_DIR);
+
+// Chrome's CheckForIllegalFilenames only looks at the top level of the extension
+// root, and reports the failure as a generic "Could not load manifest" -- so
+// catch it here, where the error can actually be explained.
+for (const entry of await readdir(extDir)) {
+  if (entry.startsWith("_") && entry !== "__MACOSX") {
+    problems.push(
+      `"${entry}" starts with "_" at the top level; Chrome reserves that prefix and will not load the extension`,
+    );
+  }
+}
+
+// MV3 forbids eval / new Function.
+if (await exists(assetsDir)) {
+  for (const file of await collectJs(assetsDir)) {
+    const code = await readFile(file, "utf8");
+    if (/\beval\s*\(/.test(code) || /new\s+Function\s*\(/.test(code)) {
+      problems.push(`${path.relative(extDir, file)} uses eval/new Function, which MV3 blocks`);
+    }
   }
 }
 
@@ -141,21 +204,9 @@ if (problems.length > 0) {
 
 // --- 5. write the manifest --------------------------------------------------
 
-const csp = [
-  // The hashes must be source expressions *within* script-src, not separate
-  // directives -- joining them with ';' would produce an invalid policy.
-  ["script-src 'self' 'wasm-unsafe-eval'", ...hashes].join(" "),
-  "object-src 'self'",
-].join("; ");
-
-// Guard against emitting a malformed policy: every ';'-separated directive must
-// be a directive name followed by at least one source expression.
-for (const directive of csp.split(";").map((d) => d.trim()).filter(Boolean)) {
-  const parts = directive.split(/\s+/);
-  if (parts.length < 2 || !/^[a-z][a-z0-9-]*$/i.test(parts[0])) {
-    fail(`Generated an invalid CSP directive: "${directive}"`);
-  }
-}
+// MV3 will not let the extension_pages policy be relaxed, so this is the
+// documented minimum and nothing more.
+const csp = "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'";
 
 const manifest = {
   manifest_version: 3,
@@ -173,12 +224,13 @@ await writeFile(path.join(extDir, "manifest.json"), `${JSON.stringify(manifest, 
 
 // --- 6. report --------------------------------------------------------------
 
-const chunkCount = (await collectJs(path.join(extDir, "_next", "static"))).length;
+const chunkCount = (await exists(assetsDir)) ? (await collectJs(assetsDir)).length : 0;
 
 console.log("\nBuilt extension/");
 console.log(`  entry          ${NEW_TAB_ENTRY}`);
-console.log(`  scripts        ${chunkCount} external chunk(s), ${inlineCount} inline`);
-console.log(`  CSP hashes     ${hashes.size}`);
+console.log(`  scripts        ${chunkCount} external chunk(s)`);
+console.log(`  flight files   ${flightFiles.length} (extracted from inline)`);
+console.log(`  inline scripts ${inlineCount}`);
 console.log(`  permissions    none requested`);
 console.log(`\nLoad it: chrome://extensions → Developer mode → Load unpacked → ./extension`);
 console.log("Run  npm run build:extension  after changing the app.\n");

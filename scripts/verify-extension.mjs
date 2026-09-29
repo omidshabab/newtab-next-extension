@@ -7,7 +7,7 @@
 
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -31,6 +31,35 @@ const MIME = {
 
 const manifest = JSON.parse(await readFile(path.join(extDir, "manifest.json"), "utf8"));
 const csp = manifest.content_security_policy.extension_pages;
+
+// Chrome refuses to load an unpacked extension if a name at the TOP LEVEL of the
+// root starts with "_" (see CheckForIllegalFilenames in
+// extensions/common/file_util.cc, which enumerates non-recursively). It only
+// surfaces as "Could not load manifest", so check it up front and only there.
+const reserved = readdirSync(extDir).filter((name) => name.startsWith("_") && name !== "__MACOSX");
+if (reserved.length > 0) {
+  console.error(
+    `\n✗ Chrome reserves top-level names starting with "_" and will not load this extension:\n` +
+      reserved.map((r) => `    ${r}`).join("\n") +
+      "\n",
+  );
+  process.exit(1);
+}
+
+// MV3 will not let the CSP be relaxed to permit inline scripts, so any inline
+// <script> is an outright load failure rather than a hydration warning.
+const pageHtml = readFileSync(path.join(extDir, "index.html"), "utf8");
+const inline = [...pageHtml.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)].filter(
+  ([, attrs, body]) => !/\bsrc\s*=/i.test(attrs) && /\S/.test(body),
+);
+if (inline.length > 0) {
+  console.error(
+    `\n✗ index.html still has ${inline.length} inline script(s).\n` +
+      `  MV3's extension_pages CSP cannot allow them, so Chrome would block hydration.\n` +
+      `  Run \`npm run build:extension\` so they get extracted into assets/flight-*.js.\n`,
+  );
+  process.exit(1);
+}
 
 // Serve the extension directory with the manifest CSP applied as a header,
 // mirroring how Chrome applies it to extension pages.
@@ -129,7 +158,7 @@ if (!/font-family:\s*(Geist|var\(--font)/i.test(dom) && !/stylesheet/i.test(dom)
   failures.push("stylesheet did not load");
 }
 
-const chunks = readdirSync(path.join(extDir, "_next", "static", "chunks")).length;
+const chunks = readdirSync(path.join(extDir, "assets", "_next", "static", "chunks")).length;
 
 console.log("\nverify-extension");
 console.log(`  chunks served      ${chunks}`);

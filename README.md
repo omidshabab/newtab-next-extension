@@ -29,9 +29,43 @@ reload on the extensions page.
 server to render on demand. `scripts/build-extension.mjs` then copies the
 minimum needed into `extension/` and writes `manifest.json`.
 
+### Reserved filenames: why the assets live in `assets/`
+
+Chrome refuses to load an unpacked extension if anything **at the top level**
+of the folder starts with `_` — the prefix is reserved by the system. Next.js
+emits an entire `_next/` tree, so a naive build produces this error:
+
+```
+Cannot load extension with file or directory name _next.
+Filenames starting with "_" are reserved for use by the system.
+```
+
+The check is `CheckForIllegalFilenames` in Chromium's
+`extensions/common/file_util.cc`, and it enumerates **non-recursively** — only
+the root is inspected, so nested `_`-prefixed names are fine (`_locales`,
+`_platform_specific` and `__MACOSX` are even explicitly allowed).
+
+So the build nests the export one level down:
+
+```
+extension/
+  assets/            <- top level is clean
+    _next/static/…   <- unchanged, no rewriting
+  index.html
+  manifest.json
+```
+
+`assetPrefix: "/assets"` in `next.config.ts` is what makes Next emit
+`/assets/_next/static/…` URLs to match. Nothing is textually rewritten, so the
+runtime's own `/_next/` chunk base path stays valid — an earlier attempt to
+rename the directory and patch that string silently broke hydration.
+
+If you change `assetPrefix`, change `ASSETS_DIR` in
+`scripts/build-extension.mjs` to match.
+
 ### The Content Security Policy problem
 
-This is the one non-obvious part, and the reason `build:extension` exists
+This is the other non-obvious part, and the reason the build script exists
 rather than just running `next build`.
 
 Manifest V3 applies `script-src 'self'` to extension pages, which **forbids
@@ -42,27 +76,37 @@ inline scripts**. A Next.js App Router export always inlines its RSC payload:
 <script>self.__next_f.push([1, "..."])</script>
 ```
 
-So the page would render but never hydrate — no interactivity, and a pile of
-console errors. MV3 does not accept `'unsafe-inline'`, so the fix is to allow
-exactly those scripts by hash. The build script SHA-256-hashes every inline
-script it finds and writes the results into the manifest:
+So the page renders but never hydrates — dead clock, dead search box, console
+errors.
+
+Unlike CSP2, **MV3 will not let you relax the policy at all.** Both escape
+hatches are rejected by Chrome at manifest parse time:
+
+```
+'content_security_policy.extension_pages': Insecure CSP value "'sha256-…'" in directive 'script-src'.
+```
+
+`'unsafe-inline'` is rejected the same way. Hashing the inline scripts does not
+work, so the build script **removes them instead**: each inline `<script>` is
+written to `assets/flight-N.js` and the tag is replaced with
+`<script src="/assets/flight-N.js"></script>`.
+
+That is safe here because those scripts only push onto `self.__next_f`, so
+loading them as same-origin files in the same document order preserves the
+semantics exactly — and `'self'` already permits them. The manifest CSP is then
+just Chrome's documented minimum:
 
 ```json
 "content_security_policy": {
-  "extension_pages": "script-src 'self' 'wasm-unsafe-eval' 'sha256-OBTN3…' 'sha256-81Cg4…'; object-src 'self'"
+  "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
 }
 ```
 
-Because `<script>` is an HTML raw-text element, the parser hands its exact
-bytes to the script engine without decoding entities — so hashing the raw
-slice of the file is precisely what the browser hashes.
-
-**Consequence:** the hashes are build-specific. Always rebuild the extension
-after changing the app; editing `out/` or `extension/` by hand will break the CSP.
+The build fails if any inline script survives, so this cannot regress silently.
 
 The build also hard-fails if it finds `eval` / `new Function` in a bundle, if a
-referenced local file is missing, or if any remote code is referenced — all
-things MV3 rejects at load time.
+referenced local file is missing, if any remote code is referenced, or if a
+top-level name starts with `_`.
 
 ## Verifying
 
@@ -91,7 +135,7 @@ the CSP, this is what will tell you.
 ## Layout
 
 ```
-next.config.ts            output: "export" — no server at runtime
+next.config.ts            output: "export" + assetPrefix "/assets"
 scripts/
   build-extension.mjs     assembles extension/ , hashes inline scripts, writes manifest
   verify-extension.mjs    headless-Chrome hydration check
@@ -101,6 +145,8 @@ assets/icons/             committed, so a clean clone builds as-is
 src/app/                  the new tab page
 src/components/new-tab.tsx  clock + search (client component)
 extension/                build output — gitignored
+  assets/_next/static/…   Next's output, nested so Chrome will load it
+  assets/flight-N.js      the RSC payload, extracted out of index.html
 ```
 
 ## Notes for extending it
