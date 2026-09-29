@@ -3,7 +3,7 @@
 import { type FormEvent, useEffect, useRef, useState } from "react";
 
 // Where the search box sends you. Swap this for any endpoint you like.
-const SEARCH_ENDPOINT = "https://duckduckgo.com/";
+const SEARCH_ENDPOINT = "https://www.google.com/search";
 
 export default function NewTab() {
   const [now, setNow] = useState<Date | null>(null);
