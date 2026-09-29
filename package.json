@@ -5,7 +5,10 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "build:extension": "next build && node scripts/build-extension.mjs",
+    "verify:extension": "node scripts/verify-extension.mjs",
     "start": "next start",
+    "icons": "node scripts/generate-icons.mjs",
     "lint": "eslint"
   },
   "dependencies": {

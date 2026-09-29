@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Extension build output -- generated, not source.
+    "extension/**",
   ]),
 ]);
 
